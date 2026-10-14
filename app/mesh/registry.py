@@ -13,9 +13,9 @@ import typing
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, create_model
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
 
-from app.errors import NotFoundError
+from app.errors import InvalidRequestError, NotFoundError
 
 QUERY = "query"
 COMMAND = "command"
@@ -78,6 +78,13 @@ class OperationSpec:
     @property
     def invalidation_tags(self) -> Tuple[str, ...]:
         return (self.service, *self.options.invalidates)
+
+    def validate_args(self, arguments: Any) -> BaseModel:
+        """Validate raw arguments (kwargs, tool input or JSON from the wire)."""
+        try:
+            return self.args_model.model_validate(arguments)
+        except ValidationError as exc:
+            raise InvalidRequestError(str(exc)) from exc
 
     def tool_definition(self) -> Dict[str, Any]:
         """Tool definition in the Anthropic Messages API format."""

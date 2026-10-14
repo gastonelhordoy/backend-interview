@@ -14,8 +14,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.mesh import factory  # noqa: E402
 from app.mesh.factory import cache  # noqa: E402
+from app.mesh.registry import default_registry  # noqa: E402
 from app.models import Base  # noqa: E402
+
+MESH_NODE_URL = "http://mesh-node.test"
 
 
 @pytest.fixture(autouse=True)
@@ -26,10 +30,21 @@ def _fresh_state():
     yield
 
 
-@pytest.fixture(params=["local", "loopback"])
-def client(request, monkeypatch):
+@pytest.fixture
+def remote_mesh(monkeypatch):
+    """Route *every* service through HttpTransport. The "remote node" is this same app,
+    reached in-process over real HTTP requests, so each cross-service call really goes
+    through serialization, the /mesh endpoint and the mesh token."""
+    services = sorted({spec.service for spec in default_registry.operations()})
+    monkeypatch.setattr(settings, "mesh_remote_services", {name: MESH_NODE_URL for name in services})
+    monkeypatch.setattr(factory, "http_client", lambda base_url: TestClient(app, base_url=base_url))
+
+
+@pytest.fixture(params=["local", "http"])
+def client(request):
     """API client; every API test runs once per mesh mode to prove they behave the same."""
-    monkeypatch.setattr(settings, "mesh_mode", request.param)
+    if request.param == "http":
+        request.getfixturevalue("remote_mesh")
     with TestClient(app) as test_client:
         yield test_client
 

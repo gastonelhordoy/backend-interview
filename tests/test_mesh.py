@@ -1,12 +1,17 @@
+import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app import schemas
+from app.auth.security import create_access_token
 from app.auth.service import AuthService
-from app.errors import NotFoundError, PermissionDeniedError
+from app.config import _service_urls
+from app.errors import NotFoundError, PermissionDeniedError, ServiceUnavailableError
+from app.main import app
 from app.mesh.cache import InMemoryCache
 from app.mesh.factory import build_mesh
 from app.mesh.mesh import Principal, ServiceMesh
-from app.mesh.transports import CachingTransport, InProcessTransport, LoopbackTransport, RoutingTransport, Transport
+from app.mesh.transports import CachingTransport, HttpTransport, InProcessTransport, RoutingTransport, Transport
 
 
 class RecordingTransport(Transport):
@@ -106,14 +111,81 @@ def test_routing_transport_sends_services_to_their_transport(db, alice):
     assert users_route.calls == ["users.me"]
 
 
-def test_loopback_transport_preserves_results_and_errors(db, alice, bob):
-    alice_mesh = ServiceMesh(alice, LoopbackTransport(InProcessTransport(db)))
-    bob_mesh = ServiceMesh(bob, LoopbackTransport(InProcessTransport(db)))
+def test_in_process_transport_keeps_one_instance_per_service(db, alice):
+    transport = InProcessTransport(db)
+    mesh = ServiceMesh(alice, transport)
+    mesh.meetings.create(data=new_meeting())
+
+    mesh.meetings.list()
+    mesh.notes.list()
+    first = dict(transport._services)
+    mesh.meetings.list()
+
+    assert set(first) == {("meetings", alice.user_id), ("notes", alice.user_id)}
+    assert transport._services == first  # same instances, not new ones per call
+    assert first[("notes", alice.user_id)].mesh is mesh
+
+
+def remote_node():
+    """The app itself, reached over real (in-process) HTTP: a stand-in for a microservice."""
+    return HttpTransport(TestClient(app, base_url="http://mesh-node.test"))
+
+
+def test_http_transport_preserves_results_and_errors(db, alice, bob):
+    alice_mesh = ServiceMesh(alice, RoutingTransport(InProcessTransport(db), routes={"meetings": remote_node()}))
+    bob_mesh = ServiceMesh(bob, remote_node())
     meeting = alice_mesh.meetings.create(data=new_meeting(attendee_ids=[bob.user_id]))
 
-    assert isinstance(bob_mesh.meetings.get(meeting_id=meeting.id), schemas.MeetingWithDetails)
+    details = bob_mesh.meetings.get(meeting_id=meeting.id)
+
+    assert isinstance(details, schemas.MeetingWithDetails)
+    assert [user.id for user in details.attendees] == [alice.user_id, bob.user_id]
     with pytest.raises(PermissionDeniedError):
         bob_mesh.meetings.delete(meeting_id=meeting.id)
+    with pytest.raises(NotFoundError):
+        bob_mesh.meetings.get(meeting_id=999)
+
+
+def test_http_transport_keeps_partial_updates_partial(db, alice):
+    mesh = ServiceMesh(alice, remote_node())
+    meeting = mesh.meetings.create(data=new_meeting(description="Daily"))
+
+    updated = mesh.meetings.update(meeting_id=meeting.id, data=schemas.MeetingUpdate(title="Retro"))
+
+    assert (updated.title, updated.description) == ("Retro", "Daily")
+
+
+def test_http_transport_reports_unreachable_nodes(alice):
+    def refuse(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = httpx.Client(base_url="http://notes-svc:8000", transport=httpx.MockTransport(refuse))
+    mesh = ServiceMesh(alice, HttpTransport(client))
+
+    with pytest.raises(ServiceUnavailableError):
+        mesh.notes.list()
+
+
+@pytest.mark.parametrize("audience", ["meeting-notes-api", "http://testserver/mcp"])
+def test_mesh_endpoint_only_accepts_mesh_tokens(alice, audience):
+    token = create_access_token(alice.user_id, audience=audience)
+
+    response = TestClient(app).post("/mesh/meetings/list", json={}, headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthenticated"
+
+
+def test_mesh_endpoint_is_not_public(client):
+    assert "/mesh/{service}/{operation}" not in client.get("/openapi.json").json()["paths"]
+
+
+def test_remote_services_setting_is_parsed():
+    assert _service_urls(" notes=http://notes-svc:8000/, tasks=http://notes-svc:8000 ") == {
+        "notes": "http://notes-svc:8000", "tasks": "http://notes-svc:8000"}
+    assert _service_urls("") == {}
+    with pytest.raises(ValueError):
+        _service_urls("notes")
 
 
 def test_cache_expires_entries():

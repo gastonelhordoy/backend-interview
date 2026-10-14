@@ -1,0 +1,44 @@
+# Example microservices deployment: the same image runs as two mesh nodes.
+#
+#   api        public API (REST, MCP, OAuth) + users and meetings services
+#   notes-svc  notes and tasks services, reachable only on the compose network
+#
+# Each node routes the other node's services through HttpTransport (POST /mesh/...), so
+# `GET /meetings/1` on api calls notes.list / tasks.list on notes-svc, which in turn
+# asks api for meetings.access. Services and mesh are unchanged: only configuration.
+#
+#   SECRET_KEY=$(openssl rand -hex 32) \
+#     docker compose -f docker-compose.yml -f docker-compose.microservices.yml up --build
+#
+# Simplifications of this example (see docs/mesh.md):
+# * Both nodes share the SQLite volume; real microservices would each own their data.
+# * Each process has its own in-memory cache and can't see the other's invalidations,
+#   so caching is disabled here. A shared Cache backend (e.g. Redis) fixes that.
+
+x-mesh-node: &mesh-node
+  # Mesh tokens are signed with SECRET_KEY: every node needs the same one.
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY, all mesh nodes must share it}
+  CACHE_TTL_SECONDS: "0"
+
+services:
+  api:
+    environment:
+      <<: *mesh-node
+      MESH_REMOTE_SERVICES: notes=http://notes-svc:8000,tasks=http://notes-svc:8000
+
+  notes-svc:
+    build: .
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *mesh-node
+      DATABASE_URL: sqlite:////data/meetings.db
+      MESH_REMOTE_SERVICES: users=http://api:8000,meetings=http://api:8000
+    volumes:
+      - sqlite-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

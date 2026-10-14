@@ -12,13 +12,15 @@ services:
       db-init:
         condition: service_completed_successfully
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
       DATABASE_URL: sqlite:////data/meetings.db
       # Set SECRET_KEY in your shell or a .env file; if empty a random key is used
       # and issued tokens stop working when the container restarts.
       SECRET_KEY: ${SECRET_KEY:-}
-      MESH_MODE: ${MESH_MODE:-local}
+      # Empty: every service runs in this container. See docker-compose.microservices.yml.
+      MESH_REMOTE_SERVICES: ${MESH_REMOTE_SERVICES:-}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
       MCP_ACCESS_TOKEN_TTL_MINUTES: ${MCP_ACCESS_TOKEN_TTL_MINUTES:-30}
       MCP_REFRESH_TOKEN_TTL_DAYS: ${MCP_REFRESH_TOKEN_TTL_DAYS:-30}
@@ -38,7 +40,7 @@ services:
     platform: linux/amd64  # only published for amd64
     command: ["sqlite_web", "--host", "0.0.0.0", "--port", "8080", "--read-only", "/data/meetings.db"]
     ports:
-      - "8080:8080"
+      - "${DB_UI_PORT:-8080}:8080"
     volumes:
       - sqlite-data:/data
     depends_on:

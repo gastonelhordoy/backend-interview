@@ -13,9 +13,11 @@ from app.errors import AuthenticationError
 _ALGORITHM = "pbkdf2_sha256"
 _JWT_ALGORITHM = "HS256"
 
-# Audience of REST API tokens. MCP tokens use the MCP resource URL instead, so neither
-# kind of token is accepted where the other is expected.
+# Audience of REST API tokens. MCP tokens use the MCP resource URL instead, and calls
+# between mesh nodes use MESH_AUDIENCE, so no kind of token is accepted where another
+# is expected.
 API_AUDIENCE = "meeting-notes-api"
+MESH_AUDIENCE = "meeting-notes-mesh"
 
 
 def hash_password(password: str) -> str:

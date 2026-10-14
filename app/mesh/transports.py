@@ -2,22 +2,27 @@
 each other, so the communication mode is chosen by composition (see ``factory.py``)::
 
     CachingTransport(RoutingTransport(default=InProcessTransport(db),
-                                      routes={"users": GrpcTransport("users:50051")}))
+                                      routes={"notes": HttpTransport(client_for_notes_node)}))
+
+Adding a communication mode (gRPC, a message queue...) means writing one ``Transport``
+and routing services to it; neither the mesh nor the services change.
 """
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
+import httpx
 from sqlalchemy.orm import Session
 
-from app.errors import ERRORS_BY_CODE, ServiceError
+from app.auth.security import MESH_AUDIENCE, create_access_token
+from app.errors import ERRORS_BY_CODE, ServiceError, ServiceUnavailableError
 from app.mesh.cache import Cache
-from app.mesh.mesh import Principal, ServiceCall
+from app.mesh.mesh import ServiceCall
 
 if TYPE_CHECKING:
     from app.mesh.mesh import ServiceMesh
+    from app.services.base import BaseService
 
 
 class Transport(ABC):
@@ -28,14 +33,25 @@ class Transport(ABC):
 
 
 class InProcessTransport(Transport):
-    """Instantiates the service locally, bound to the caller's DB session and mesh."""
+    """The default: services live in this process.
+
+    Holds a reference to each service it has served: the instance is created on first
+    use, bound to the DB session, the caller's principal and mesh, and reused for every
+    later call through this transport (one transport per mesh, i.e. per request).
+    """
 
     def __init__(self, db: Session):
         self.db = db
+        self._services: Dict[Tuple[str, int], BaseService] = {}
 
     def send(self, call: ServiceCall, mesh: ServiceMesh) -> Any:
-        service = call.spec.service_cls(db=self.db, principal=call.principal, mesh=mesh)
-        return getattr(service, call.spec.name)(**call.kwargs)
+        return getattr(self.service(call, mesh), call.spec.name)(**call.kwargs)
+
+    def service(self, call: ServiceCall, mesh: ServiceMesh) -> BaseService:
+        key = (call.spec.service, call.principal.user_id)
+        if key not in self._services:
+            self._services[key] = call.spec.service_cls(db=self.db, principal=call.principal, mesh=mesh)
+        return self._services[key]
 
 
 class CachingTransport(Transport):
@@ -78,49 +94,43 @@ class RoutingTransport(Transport):
         return self.routes.get(call.spec.service, self.default).send(call, mesh)
 
 
-class LoopbackTransport(Transport):
-    """Runs calls in-process but pushes request, result and errors through JSON, exactly
-    as a network transport would. Used to prove services are wire-safe."""
+class HttpTransport(Transport):
+    """Calls a service running in another process (a microservice) over HTTP.
 
-    def __init__(self, inner: Transport):
-        self.inner = inner
+    Wire format, served by ``app/api/mesh.py`` on the remote node::
+
+        POST /mesh/<service>/<operation>
+        Authorization: Bearer <JWT, aud=meeting-notes-mesh, sub=<user id>, 1 minute>
+        <operation arguments as JSON>
+
+        200 {"result": <operation result as JSON>}
+        4xx/5xx {"error": {"code": "not_found", "message": "..."}}
+
+    The caller's identity travels as a short-lived token signed with the shared
+    ``SECRET_KEY``, so the remote node runs the operation as the same user. Domain errors
+    are re-raised by ``code``; network failures become ``ServiceUnavailableError``.
+    """
+
+    def __init__(self, client: httpx.Client):
+        self.client = client  # its base_url is the remote node
 
     def send(self, call: ServiceCall, mesh: ServiceMesh) -> Any:
         spec = call.spec
-        request = json.dumps({
-            "service": spec.service,
-            "operation": spec.name,
-            "user_id": call.principal.user_id,  # a real transport would forward the bearer token
-            # exclude_unset keeps partial updates partial: omitted fields must not become nulls.
-            "args": json.loads(call.args.model_dump_json(exclude_unset=True)),
-        })
-        response = json.loads(self._serve(request, mesh))
-        if "error" in response:
-            raise ERRORS_BY_CODE.get(response["error"]["code"], ServiceError)(response["error"]["message"])
-        return spec.result_adapter.validate_python(response["result"])
-
-    def _serve(self, raw_request: str, mesh: ServiceMesh) -> str:
-        """The "server side": rebuild the call from the wire, run it, serialize the result."""
-        request = json.loads(raw_request)
-        spec = mesh.registry.operation(request["service"], request["operation"])
-        call = ServiceCall(spec, spec.args_model.model_validate(request["args"]), Principal(request["user_id"]))
+        token = create_access_token(call.principal.user_id, audience=MESH_AUDIENCE, ttl_minutes=1)
         try:
-            result = self.inner.send(call, mesh)
-        except ServiceError as exc:
-            return json.dumps({"error": {"code": exc.code, "message": exc.message}})
-        return json.dumps({"result": json.loads(spec.result_adapter.dump_json(result))})
+            response = self.client.post(
+                f"/mesh/{spec.service}/{spec.name}",
+                # exclude_unset keeps partial updates partial: omitted fields must not become nulls.
+                content=call.args.model_dump_json(exclude_unset=True),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ServiceUnavailableError(f"Service {spec.service!r} is unavailable") from exc
 
-
-class GrpcTransport(Transport):
-    """Placeholder for production: forward ``ServiceCall``s to a remote mesh node.
-
-    The wire format would be what ``LoopbackTransport`` already produces (service,
-    operation, JSON args, caller credentials); the server side rebuilds the call with
-    the registry and runs it through its own ``InProcessTransport``.
-    """
-
-    def __init__(self, target: str):
-        self.target = target
-
-    def send(self, call: ServiceCall, mesh: ServiceMesh) -> Any:
-        raise NotImplementedError("gRPC transport is not implemented; use MESH_MODE=local or loopback")
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            error = body["error"]
+            raise ERRORS_BY_CODE.get(error.get("code"), ServiceError)(error.get("message", "Remote error"))
+        if response.status_code != 200 or not isinstance(body, dict) or "result" not in body:
+            raise ServiceUnavailableError(f"Service {spec.service!r} answered HTTP {response.status_code}")
+        return spec.result_adapter.validate_python(body["result"])

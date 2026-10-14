@@ -4,9 +4,8 @@ import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-from app.errors import InvalidRequestError
 from app.mesh.registry import OperationSpec, ServiceRegistry, default_registry
 
 if TYPE_CHECKING:
@@ -36,12 +35,13 @@ class ServiceCall:
 
 
 class ServiceMesh:
-    """A per-user gateway to all services.
+    """A per-user gateway to all services: the interface every service is given.
 
     Every call (from the API, from an LLM tool call, or from one service to another)
-    goes through ``call`` → validation → ``transport.send``. The transport decides how
-    the call is delivered (in-process, cached, over the network...), so services never
-    hold references to each other and cannot act as anyone but ``principal``.
+    goes through ``call`` → validation → ``transport.send``. The mesh decides *what* is
+    called and on whose behalf; the transport decides *how* the call travels
+    (in-process, cached, over HTTP...). Services never hold references to each other
+    and cannot act as anyone but ``principal``.
     """
 
     def __init__(self, principal: Principal, transport: Transport, registry: ServiceRegistry = default_registry):
@@ -68,11 +68,7 @@ class ServiceMesh:
         return spec.result_adapter.dump_python(self._dispatch(spec, arguments), mode="json")
 
     def _dispatch(self, spec: OperationSpec, arguments: Mapping[str, Any]) -> Any:
-        try:
-            args = spec.args_model.model_validate(arguments)
-        except ValidationError as exc:
-            raise InvalidRequestError(str(exc)) from exc
-        return self.transport.send(ServiceCall(spec, args, self.principal), self)
+        return self.transport.send(ServiceCall(spec, spec.validate_args(arguments), self.principal), self)
 
 
 class ServiceProxy:
