@@ -25,7 +25,24 @@ To do this:
 
 ## Implementation
 
-See [docs/architecture.md](docs/architecture.md) for the design: services, service mesh, transports, caching, LLM tools, privacy rules, authentication and model changes.
+Design documents, with diagrams:
+
+* [docs/architecture.md](docs/architecture.md): layers, services, LLM tools, privacy rules, authentication, model changes.
+* [docs/mesh.md](docs/mesh.md): the service mesh, its transports, how to switch them (in memory, HTTP between microservices, gRPC) and caching.
+* [docs/mcp.md](docs/mcp.md): MCP server, `@mcp_tool`, OAuth 2.1 for MCP clients.
+
+How the requirements map to the code:
+
+| Requirement | Where |
+|---|---|
+| Service layer backed by the DB | `app/services/` on SQLAlchemy (`app/models.py`) |
+| Authentication | `app/auth/`: registration, PBKDF2 passwords, JWT bearer tokens |
+| One service per resource, on a base class | `BaseService` + `UsersService`, `MeetingsService`, `NotesService`, `TasksService` |
+| Calls between services route through the mesh | services only use `self.mesh.<service>.<op>()` |
+| User-specific mesh with caching | one `ServiceMesh` per request and user; `CachingTransport` (per-user keys, tag invalidation) |
+| Composable local / cloud communication | `Transport` chain: `InProcessTransport` (default), `HttpTransport` (microservices), routed per service by `MESH_REMOTE_SERVICES` |
+| Decorator for `service_mesh.get_tools()` | `@service` / `@query` / `@command` in `app/mesh/registry.py` |
+| Only the user's resources are accessible | each service's `_visible()` query; invisible = 404 |
 
 ## Setup
 
@@ -38,7 +55,16 @@ docker compose up --build
 * API: `http://localhost:8000`
 * SQLite browser (read-only, [sqlite-web](https://github.com/coleifer/sqlite-web)): `http://localhost:8080`
 
-SQLite is an embedded database, so it has no server process. The database file lives on the `sqlite-data` volume. The API container writes it, and the `db` container serves a UI over the same file. Data persists across restarts; `docker compose down -v` wipes it. Set `SECRET_KEY` (in your shell or in `.env`) so tokens keep working across restarts.
+SQLite is an embedded database, so it has no server process. The database file lives on the `sqlite-data` volume. The API container writes it, and the `db` container serves a UI over the same file. Data persists across restarts; `docker compose down -v` wipes it. Set `SECRET_KEY` (in your shell or in `.env`) so tokens keep working across restarts. `API_PORT` and `DB_UI_PORT` change the published ports.
+
+### Docker as microservices (example)
+
+```bash
+SECRET_KEY=$(openssl rand -hex 32) \
+  docker compose -f docker-compose.yml -f docker-compose.microservices.yml up --build
+```
+
+The same image runs as two mesh nodes: `api` (public API, users and meetings) and `notes-svc` (notes and tasks, internal). Calls between them go over HTTP through the mesh; the services are unchanged. See [docs/mesh.md](docs/mesh.md#remote-calls-the-microservices-example).
 
 ### Local
 
@@ -46,10 +72,10 @@ SQLite is an embedded database, so it has no server process. The database file l
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/uvicorn main:app --reload
-.venv/bin/pytest            # tests run in both mesh modes (local, loopback)
+.venv/bin/pytest            # every API test runs in both mesh modes (local, http)
 ```
 
-Configuration (environment variables): `DATABASE_URL` (default `sqlite:///./meetings.db`), `SECRET_KEY`, `ACCESS_TOKEN_TTL_MINUTES` (60), `MESH_MODE` (`local` | `loopback`), `CACHE_TTL_SECONDS` (300), `PASSWORD_HASH_ITERATIONS` (600000), `MCP_ACCESS_TOKEN_TTL_MINUTES` (30), `MCP_REFRESH_TOKEN_TTL_DAYS` (30), `PUBLIC_BASE_URL` (derived from the request).
+Configuration (environment variables): `DATABASE_URL` (default `sqlite:///./meetings.db`), `SECRET_KEY`, `ACCESS_TOKEN_TTL_MINUTES` (60), `MESH_REMOTE_SERVICES` (empty: all in-process; e.g. `notes=http://notes-svc:8000`), `MESH_REMOTE_TIMEOUT_SECONDS` (10), `CACHE_TTL_SECONDS` (300), `PASSWORD_HASH_ITERATIONS` (600000), `MCP_ACCESS_TOKEN_TTL_MINUTES` (30), `MCP_REFRESH_TOKEN_TTL_DAYS` (30), `PUBLIC_BASE_URL` (derived from the request).
 
 ## Getting started: create your first user
 
@@ -85,6 +111,8 @@ The database starts empty and there are **no default users**: create one with th
 **To try the privacy rules**, register a second user. That user won't see the first user's meetings until they are added as an attendee (`attendee_ids`).
 
 ## MCP server (use the API from a chat)
+
+Full design, with diagrams: [docs/mcp.md](docs/mcp.md).
 
 Endpoint functions marked with `@mcp_tool` (`app/mcp/registry.py`) are published as MCP tools at `http://localhost:8000/mcp`. The transport is Streamable HTTP. Name, description, HTTP method, path and parameter schema come from the FastAPI route, so the tools always match the API. Each tool call runs as the user who signed in for that connection.
 
@@ -214,8 +242,9 @@ curl -X POST http://localhost:8000/notes/ -H "Authorization: Bearer $TOKEN" \
 - `app/auth/` - Password hashing, JWT, registration/login, `get_current_principal`
 - `app/mcp/` - `@mcp_tool` endpoint registry and the MCP server mounted at `/mcp`
 - `app/oauth/` - OAuth 2.1 authorization server for MCP clients (discovery, registration, login page, tokens)
-- `app/mesh/` - Service mesh: `@service`/`@query`/`@command` registry, `ServiceMesh`, transports, cache, factory
+- `app/mesh/` - Service mesh: `@service`/`@query`/`@command` registry, `ServiceMesh`, transports (in-process, caching, routing, HTTP), cache, factory
+- `app/api/mesh.py` - Internal `POST /mesh/{service}/{operation}`: the server side of `HttpTransport`
 - `app/services/` - `BaseService` and one service per resource (users, meetings, notes, tasks)
 - `app/models.py` / `app/schemas.py` / `app/db.py` - SQLAlchemy models, Pydantic schemas, engine and sessions
-- `tests/` - API, privacy and mesh tests
-- `Dockerfile`, `docker-compose.yml` - API + SQLite volume + sqlite-web
+- `tests/` - API, privacy, mesh, MCP and OAuth tests
+- `Dockerfile`, `docker-compose.yml` - API + SQLite volume + sqlite-web; `docker-compose.microservices.yml` - two-node example

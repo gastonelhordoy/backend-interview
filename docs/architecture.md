@@ -1,27 +1,29 @@
 # Architecture
 
+Detailed documents:
+
+* [Service mesh](mesh.md): the mesh interface, transports, how to switch them, the microservices example, caching (with diagrams).
+* [MCP support](mcp.md): `@mcp_tool`, the MCP server, OAuth 2.1 (with diagrams).
+
 ## Layers
 
-```
-HTTP (app/api/*)          thin FastAPI routers: parse request, call the mesh, return schema
-   │  Depends(get_mesh)   one mesh per request, bound to the authenticated user
-   ▼
-ServiceMesh (app/mesh)    validate args → ServiceCall → transport pipeline
-   │
-   ▼  Transport pipeline (composable)
-CachingTransport ─► [LoopbackTransport] ─► [RoutingTransport] ─► InProcessTransport
-   │
-   ▼
-Services (app/services)   one per resource, BaseService subclasses, own their tables
-   │
-   ▼
-SQLAlchemy models (app/models.py) on SQLite
+```mermaid
+flowchart TB
+    http["HTTP: app/api/*<br/>thin routers: parse request, call the mesh, return schema"]
+    mcp["MCP: POST /mcp<br/>replays tool calls as REST requests"]
+    mesh["ServiceMesh: app/mesh<br/>one per request, bound to the user · validate args → ServiceCall"]
+    chain["Transport chain<br/>Caching → Routing → InProcess | Http"]
+    svc["Services: app/services<br/>one per resource, BaseService subclasses, own their tables"]
+    db[("SQLAlchemy models on SQLite")]
+    mcp --> http
+    http -- "Depends(get_mesh)" --> mesh --> chain --> svc --> db
+    svc -. "self.mesh.other.op()" .-> mesh
 ```
 
 Request flow for `GET /meetings/1` as Alice:
 
 1. `get_current_principal` validates the JWT → `Principal(user_id=alice)`.
-2. `get_mesh` builds `ServiceMesh(alice, CachingTransport(InProcessTransport(db)))`.
+2. `get_mesh` builds `ServiceMesh(alice, CachingTransport(InProcessTransport(db)))` (or with a `RoutingTransport` to remote nodes, see [mesh.md](mesh.md#changing-the-transport)).
 3. The router calls `mesh.meetings.get(meeting_id=1)`. The mesh validates the arguments against the operation's input model and sends a `ServiceCall` down the transport pipeline.
 4. `MeetingsService.get` loads the meeting through `_visible()`, so it only finds it if Alice attends. Then it calls `mesh.notes.list(...)` and `mesh.tasks.list(...)` through the *same* mesh. Those services ask `mesh.meetings.access(...)` before returning anything.
 
@@ -60,83 +62,13 @@ At registration, the method signature becomes a Pydantic input model and the ret
 
 `GET /tools/` and `POST /tools/{name}` expose these over HTTP.
 
-## Mesh transports
+## Mesh transports and caching
 
-Every transport implements `send(call, mesh)`, and each one either delivers the call or wraps another transport:
+See [mesh.md](mesh.md). In short: the `ServiceMesh` is the interface services receive; *how* a call travels is a chain of `Transport`s (`CachingTransport`, `RoutingTransport`, `InProcessTransport`, `HttpTransport`) composed in `app/mesh/factory.py` from `MESH_REMOTE_SERVICES`. `InProcessTransport` is the default and holds the local service instances; `HttpTransport` reaches services running on another node through `POST /mesh/{service}/{operation}`. `docker-compose.microservices.yml` runs the app as two nodes.
 
-| Transport | Role |
-|---|---|
-| `InProcessTransport` | Instantiates the service locally with the caller's DB session and mesh |
-| `CachingTransport` | Caches query results per user; commands invalidate tags |
-| `RoutingTransport` | Sends each service's calls to its own transport (e.g. some remote) |
-| `LoopbackTransport` | Runs in-process, but serializes request, result and errors to JSON as a network would |
-| `GrpcTransport` | Placeholder showing where a remote transport plugs in (not implemented) |
+## MCP server and OAuth
 
-`MESH_MODE` selects the composition (`app/mesh/factory.py`): `local` = cache → in-process; `loopback` = cache → loopback → in-process. The whole API test suite runs in both modes. This already caught one real wire bug: partial updates lost their "unset" fields when serialized. A production deployment would be, for example:
-
-```python
-CachingTransport(RoutingTransport(default=InProcessTransport(db),
-                                  routes={"users": GrpcTransport("users:50051")}), RedisCache(...), ttl)
-```
-
-A remote transport must forward the caller's credentials (the bearer token), not a bare user id. `LoopbackTransport` sends the id only because it never leaves the process.
-
-### Caching
-
-* The key is `user:<id>:<service>.<op>:<args json>`, so entries are never shared between users.
-* Each query result is tagged with its own service plus `depends_on`. For example, `notes.list` depends on `meetings`, because attendance decides which notes are visible.
-* A successful command invalidates its service's tag (plus `invalidates`) **for all users**. This is required because Alice editing a meeting changes what Bob may see.
-* The cache backend is the `Cache` interface. `InMemoryCache` is per process; use a shared backend such as Redis when running several workers.
-* Known limitation: a read that races a concurrent write can cache a stale value until the TTL expires (`CACHE_TTL_SECONDS`, default 300). Versioned tags would close this gap.
-
-## MCP server
-
-There are two tool layers, at different levels:
-
-| | Mesh tools (`/tools`) | MCP tools (`/mcp`) |
-|---|---|---|
-| Declared with | `@query` / `@command` on service methods | `@mcp_tool` on endpoint functions |
-| Granularity | Service operations (`meetings_get`) | HTTP endpoints (`get_meeting`) |
-| Consumer | Code embedding an LLM in-process (`mesh.get_tools()` / `execute_tool`) | External agents and chats over the MCP protocol |
-
-`@mcp_tool` only marks the function. `endpoint_tools(app)` walks `app.routes` once and, for each marked `APIRoute`, reads the path, method and the path/query/body parameters FastAPI already parsed (`get_flat_dependant`). From those it builds one Pydantic input model per tool: that model is the `inputSchema` and validates incoming arguments. Nothing in the decorator can drift from the real route.
-
-`app/mcp/server.py` is a small, stateless implementation of the MCP Streamable HTTP transport. It handles `POST /mcp` with single JSON-RPC messages and JSON responses (no SSE, no sessions), and implements `initialize`, `ping`, `tools/list` and `tools/call`. The official `mcp` SDK wasn't used because it requires `pydantic>=2.12`, while the project pins 2.5.3. Behaviour was checked against the official SDK client.
-
-`tools/call` doesn't call the endpoint function directly. It replays the call as an HTTP request against the same app, in-process through `httpx.ASGITransport`. The request is authenticated with a one-minute REST token minted for the MCP token's user, because the MCP token itself isn't valid for the REST API. Validation, the service mesh and the privacy rules therefore apply exactly as they do for any REST client. HTTP errors (403/404/422) come back as tool results with `isError: true`, so the model can see and correct them.
-
-* The body is sent with `exclude_unset`, so partial updates stay partial (the same rule as `LoopbackTransport`).
-* Requests carrying a non-local `Origin` header are rejected (DNS-rebinding protection, required by the MCP spec).
-* Every request, `tools/list` included, needs an MCP access token (next section).
-
-## MCP authorization (OAuth 2.1)
-
-`app/oauth/` is a small authorization server that implements the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization). MCP clients get their own sign-in flow and their own long-lived session, without a long-lived bearer token ever existing.
-
-```
-client ──POST /mcp──────────────────────► 401  WWW-Authenticate: Bearer resource_metadata=".../oauth-protected-resource/mcp"
-client ──GET  /.well-known/oauth-protected-resource/mcp ─► {resource: <base>/mcp, authorization_servers: [<base>]}
-client ──GET  /.well-known/oauth-authorization-server ───► endpoints, S256, grant types
-client ──POST /oauth/register ───────────► client_id (+ secret for confidential clients)
-browser ─GET  /oauth/authorize?…&code_challenge=… ─► login page ─POST─► 302 redirect_uri?code=…&state=…&iss=…
-client ──POST /oauth/token (code + code_verifier) ─► access token (aud=<base>/mcp, 30 min) + refresh token (30 days)
-client ──POST /oauth/token (refresh_token) ────────► new access token + new refresh token (old one is now spent)
-```
-
-| Piece | Decision |
-|---|---|
-| Grants | `authorization_code` with **PKCE S256 required**, plus `refresh_token`. No implicit or password grant. |
-| Clients | Dynamic registration (RFC 7591). Supports public (`none`) and confidential (`client_secret_post`/`basic`, secret stored hashed) clients. Redirect URIs must be https, http on loopback (any port, RFC 8252), or a private-use scheme. |
-| Login page | Server-rendered HTML (`templates/login.html`), escaped output, `X-Frame-Options: DENY`. Client and redirect URI are validated before anything is shown or redirected (no open redirect); every POST re-validates the hidden fields. |
-| Access token | JWT, `aud` = MCP resource URL, `sid` = grant id, TTL `MCP_ACCESS_TOKEN_TTL_MINUTES`. `/mcp` checks the audience and that the grant isn't revoked, so revocation takes effect immediately. |
-| Refresh token | Opaque, SHA-256 hashed in `oauth_refresh_tokens`, TTL `MCP_REFRESH_TOKEN_TTL_DAYS`, rotated on every use, bound to its client. **Reuse of a spent token revokes the whole grant** (RFC 9700 §4.14.2). |
-| Codes | Opaque, hashed, single-use (consumed even if the exchange fails), 5 minutes, bound to client, redirect URI and PKCE challenge. |
-| Audience separation | REST tokens have `aud=meeting-notes-api`; MCP tokens have `aud=<base>/mcp`. Neither is accepted where the other belongs. |
-| Revocation | `POST /oauth/revoke` (RFC 7009) revokes the grant: its refresh tokens and live access tokens. |
-
-The issuer, resource and audience URLs come from `PUBLIC_BASE_URL`, or from the request's base URL when it isn't set. The flow was checked end to end against the Docker container with the official MCP SDK OAuth client (`OAuthClientProvider`), with the browser step simulated.
-
-Not implemented: a consent screen separate from login, remembered browser sessions (you sign in each time you authorize a client), Client ID Metadata Documents, rate limiting of the login form, and cleanup of spent refresh tokens.
+See [mcp.md](mcp.md). Endpoints marked `@mcp_tool` are published at `POST /mcp` (Streamable HTTP, stateless); tool calls are replayed as in-process REST requests for the signed-in user. `/mcp` only accepts access tokens from the OAuth 2.1 server in `app/oauth/` (discovery, dynamic registration, PKCE, rotating refresh tokens with reuse detection).
 
 ## Privacy rules
 
