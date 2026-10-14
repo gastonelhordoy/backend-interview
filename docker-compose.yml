@@ -1,0 +1,49 @@
+services:
+  # One-shot: give the non-root API user (uid 1000) ownership of the SQLite volume.
+  db-init:
+    image: busybox:1.36
+    command: ["chown", "1000:1000", "/data"]
+    volumes:
+      - sqlite-data:/data
+
+  api:
+    build: .
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/meetings.db
+      # Set SECRET_KEY in your shell or a .env file; if empty a random key is used
+      # and issued tokens stop working when the container restarts.
+      SECRET_KEY: ${SECRET_KEY:-}
+      MESH_MODE: ${MESH_MODE:-local}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
+      MCP_ACCESS_TOKEN_TTL_MINUTES: ${MCP_ACCESS_TOKEN_TTL_MINUTES:-30}
+      MCP_REFRESH_TOKEN_TTL_DAYS: ${MCP_REFRESH_TOKEN_TTL_DAYS:-30}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+    volumes:
+      - sqlite-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # SQLite is an embedded, file-based database: the API container owns the file.
+  # This container serves a web UI over the same volume to inspect it.
+  db:
+    image: coleifer/sqlite-web:latest
+    platform: linux/amd64  # only published for amd64
+    command: ["sqlite_web", "--host", "0.0.0.0", "--port", "8080", "--read-only", "/data/meetings.db"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - sqlite-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  sqlite-data:
