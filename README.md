@@ -28,7 +28,7 @@ To do this:
 Design documents, with diagrams:
 
 * [docs/architecture.md](docs/architecture.md): layers, services, LLM tools, privacy rules, authentication, model changes.
-* [docs/mesh.md](docs/mesh.md): the service mesh, its transports, how to switch them (in memory, HTTP between microservices, gRPC) and caching.
+* [docs/mesh.md](docs/mesh.md): the service mesh, its transports, how to switch them (in memory, HTTP between microservices, gRPC) and caching (in memory or distributed with Redis).
 * [docs/mcp.md](docs/mcp.md): MCP server, `@mcp_tool`, OAuth 2.1 for MCP clients.
 
 How the requirements map to the code:
@@ -39,7 +39,7 @@ How the requirements map to the code:
 | Authentication | `app/auth/`: registration, PBKDF2 passwords, JWT bearer tokens |
 | One service per resource, on a base class | `BaseService` + `UsersService`, `MeetingsService`, `NotesService`, `TasksService` |
 | Calls between services route through the mesh | services only use `self.mesh.<service>.<op>()` |
-| User-specific mesh with caching | one `ServiceMesh` per request and user; `CachingTransport` (per-user keys, tag invalidation) |
+| User-specific mesh with caching | one `ServiceMesh` per request and user; `CachingTransport` (per-user keys, tag invalidation) on an in-memory or Redis (distributed) cache |
 | Composable local / cloud communication | `Transport` chain: `InProcessTransport` (default), `HttpTransport` (microservices), routed per service by `MESH_REMOTE_SERVICES` |
 | Decorator for `service_mesh.get_tools()` | `@service` / `@query` / `@command` in `app/mesh/registry.py` |
 | Only the user's resources are accessible | each service's `_visible()` query; invisible = 404 |
@@ -64,7 +64,7 @@ SECRET_KEY=$(openssl rand -hex 32) \
   docker compose -f docker-compose.yml -f docker-compose.microservices.yml up --build
 ```
 
-The same image runs as two mesh nodes: `api` (public API, users and meetings) and `notes-svc` (notes and tasks, internal). Calls between them go over HTTP through the mesh; the services are unchanged. See [docs/mesh.md](docs/mesh.md#remote-calls-the-microservices-example).
+The same image runs as two mesh nodes: `api` (public API, users and meetings) and `notes-svc` (notes and tasks, internal). Calls between them go over HTTP through the mesh, and both nodes share a Redis query cache, so a write on either node invalidates what the other cached. The services are unchanged. See [docs/mesh.md](docs/mesh.md#remote-calls-the-microservices-example).
 
 ### Local
 
@@ -75,7 +75,7 @@ python3 -m venv .venv
 .venv/bin/pytest            # every API test runs in both mesh modes (local, http)
 ```
 
-Configuration (environment variables): `DATABASE_URL` (default `sqlite:///./meetings.db`), `SECRET_KEY`, `ACCESS_TOKEN_TTL_MINUTES` (60), `MESH_REMOTE_SERVICES` (empty: all in-process; e.g. `notes=http://notes-svc:8000`), `MESH_REMOTE_TIMEOUT_SECONDS` (10), `CACHE_TTL_SECONDS` (300), `PASSWORD_HASH_ITERATIONS` (600000), `MCP_ACCESS_TOKEN_TTL_MINUTES` (30), `MCP_REFRESH_TOKEN_TTL_DAYS` (30), `PUBLIC_BASE_URL` (derived from the request).
+Configuration (environment variables): `DATABASE_URL` (default `sqlite:///./meetings.db`), `SECRET_KEY`, `ACCESS_TOKEN_TTL_MINUTES` (60), `MESH_REMOTE_SERVICES` (empty: all in-process; e.g. `notes=http://notes-svc:8000`), `MESH_REMOTE_TIMEOUT_SECONDS` (10), `CACHE_TTL_SECONDS` (300), `CACHE_URL` (empty: in-memory; `redis://host:6379/0`: cache shared by every process), `PASSWORD_HASH_ITERATIONS` (600000), `MCP_ACCESS_TOKEN_TTL_MINUTES` (30), `MCP_REFRESH_TOKEN_TTL_DAYS` (30), `PUBLIC_BASE_URL` (derived from the request).
 
 ## Getting started: create your first user
 

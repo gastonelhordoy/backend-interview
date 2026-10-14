@@ -182,7 +182,7 @@ transport = CachingTransport(
         default=InProcessTransport(db),
         routes={"notes": HttpTransport(httpx.Client(base_url="http://notes-svc:8000"))},
     ),
-    cache=RedisCache(...),      # any Cache implementation
+    cache=RedisCache.from_url("redis://redis:6379/0"),   # any Cache implementation
     ttl_seconds=300,
 )
 mesh = ServiceMesh(principal, transport)
@@ -232,6 +232,7 @@ flowchart LR
             svcMesh["mesh<br/>local: notes, tasks<br/>remote: users, meetings"]
         end
         db[("SQLite volume<br/>(shared in this demo)")]
+        redis[("Redis<br/>shared query cache")]
     end
 
     client -- "REST / MCP" --> apiMesh
@@ -239,6 +240,8 @@ flowchart LR
     svcMesh -- "POST /mesh/meetings/access" --> apiMesh
     apiMesh --- db
     svcMesh --- db
+    apiMesh -.- redis
+    svcMesh -.- redis
 ```
 
 ```bash
@@ -279,7 +282,7 @@ sequenceDiagram
 ### Simplifications of the example
 
 * **Shared database.** Both nodes use the same SQLite volume. Real microservices would each own their tables (the services already only touch their own tables, so the split is possible).
-* **Cache coherence.** The cache sits on the caller's side of the chain, and each process has its own `InMemoryCache`. A command run on one node can't invalidate entries cached on the other, so the example sets `CACHE_TTL_SECONDS=0`. A shared `Cache` implementation (e.g. Redis, where `invalidate_tags` reaches every node) restores caching.
+* **Cache.** The cache sits on the caller's side of the chain, so both nodes cache. They share one Redis (`CACHE_URL`), which lets a write on either node invalidate entries cached by both. See [Distributed cache](#distributed-cache-redis).
 * **Failures.** A refused connection, timeout or malformed answer becomes `ServiceUnavailableError` (HTTP 503). There are no retries or circuit breakers.
 
 ## Caching
@@ -297,8 +300,56 @@ flowchart LR
 * A query is tagged with its service plus `depends_on`. `notes.list` depends on `meetings`, because attendance decides which notes are visible.
 * Invalidation is global across users: Alice editing a meeting changes what Bob may see, and removing an attendee revokes their cached reads at once.
 * Known limitation: a read that races a concurrent write can cache a stale value until the TTL expires (`CACHE_TTL_SECONDS`, default 300). Versioned tags would close this gap.
+* The backend is the `Cache` interface: `InMemoryCache` (default, one process) or `RedisCache` (shared), chosen by `CACHE_URL`.
+
+### Distributed cache (Redis)
+
+`InMemoryCache` lives inside one process. As soon as there is more than one process (mesh nodes, or several uvicorn workers), each has its own copy. A command on one node then can't invalidate what another node cached, and that node keeps serving stale results until the TTL expires. Stale results here are a privacy problem: a user removed from a meeting would keep reading its notes. `RedisCache` (`app/mesh/cache.py`) implements the same `Cache` interface on Redis, shared by every node.
+
+Enable it with one setting; nothing else changes:
+
+```bash
+CACHE_URL=redis://redis:6379/0      # empty (default): InMemoryCache
+```
+
+```mermaid
+flowchart LR
+    subgraph a["api node"]
+        ca["CachingTransport"]
+    end
+    subgraph n["notes-svc node"]
+        cn["CachingTransport"]
+    end
+    subgraph r["Redis"]
+        e1["mesh-cache:entry:user:2:meetings.accessible_ids:{}<br/>STRING, TTL"]
+        t1["mesh-cache:tag:meetings<br/>SET of entry keys, TTL"]
+    end
+    cn -- "query: GET / SET EX + SADD tag" --> r
+    ca -- "command meetings.update:<br/>MULTI SMEMBERS tag + DEL tag EXEC,<br/>then DEL entries" --> r
+```
+
+**Data layout.** Each entry is a string with the entry's TTL (`SET … EX`). Each tag is a set holding the keys of its entries. Every key starts with `mesh-cache:`, so the cache can share a Redis with other data.
+
+**Invalidation.** `invalidate_tags` reads and deletes each tag set inside one `MULTI/EXEC` transaction, then deletes the entries it found. An entry cached concurrently lands in a new, empty set, so the invalidation doesn't lose it.
+
+**Expiry.** Tag sets receive the entry TTL on every add. Every entry shares the same TTL (`CACHE_TTL_SECONDS`), so a set outlives its entries and expires on its own if nobody invalidates it. Keys of already-expired entries can stay in a set until then; deleting them is harmless.
+
+**Failure policy.** If Redis is down:
+* A failed read is logged and treated as a miss, so the operation still runs.
+* A failed write is logged, and the result isn't cached.
+* A failed invalidation **raises**. Silently keeping stale entries could serve data the user may no longer see.
+
+**Redis configuration.** Use `maxmemory-policy noeviction`, as in the compose example. An `*-lru` policy could evict a tag set and lose invalidations. With `noeviction`, a full Redis only stops new entries from being cached; deletes still work.
+
+The example walked through above was checked against the compose stack:
+1. Ben lists notes. `notes-svc` caches his `meetings.accessible_ids` in Redis.
+2. Ann removes Ben from the meeting on `api`.
+3. Ben's next list is empty, and the meeting returns 404 for him.
+
+With per-process caches, step 3 would still show the notes. `tests/test_cache.py` covers both implementations against the same contract (Redis through `fakeredis`), sharing between nodes, the outage policy, and that cross-node scenario.
 
 ## Testing the transports
 
 * Every API test runs twice (`tests/conftest.py`): once in memory (`local`) and once with **every** service behind `HttpTransport` (`http`). In `http` mode the "remote node" is the same app reached through real HTTP requests in-process, so each cross-service call goes through serialization, `/mesh` and the mesh token. If something works in `local` but fails in `http`, it isn't wire-safe.
+* `tests/test_cache.py` runs the same contract against `InMemoryCache` and `RedisCache`.
 * `tests/test_mesh.py` covers instance reuse, routing, results and errors across HTTP, partial updates, unreachable nodes and token audiences.

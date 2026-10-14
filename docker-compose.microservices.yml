@@ -2,6 +2,7 @@
 #
 #   api        public API (REST, MCP, OAuth) + users and meetings services
 #   notes-svc  notes and tasks services, reachable only on the compose network
+#   redis      query cache shared by both nodes
 #
 # Each node routes the other node's services through HttpTransport (POST /mesh/...), so
 # `GET /meetings/1` on api calls notes.list / tasks.list on notes-svc, which in turn
@@ -10,18 +11,34 @@
 #   SECRET_KEY=$(openssl rand -hex 32) \
 #     docker compose -f docker-compose.yml -f docker-compose.microservices.yml up --build
 #
-# Simplifications of this example (see docs/mesh.md):
-# * Both nodes share the SQLite volume; real microservices would each own their data.
-# * Each process has its own in-memory cache and can't see the other's invalidations,
-#   so caching is disabled here. A shared Cache backend (e.g. Redis) fixes that.
+# Both nodes use one Redis cache: a write on either node invalidates the entries cached
+# by both (with per-process in-memory caches, a node would serve stale results).
+#
+# Simplification of this example (see docs/mesh.md): both nodes share the SQLite
+# volume; real microservices would each own their data.
 
 x-mesh-node: &mesh-node
   # Mesh tokens are signed with SECRET_KEY: every node needs the same one.
   SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY, all mesh nodes must share it}
-  CACHE_TTL_SECONDS: "0"
+  CACHE_URL: redis://redis:6379/0
 
 services:
+  redis:
+    image: redis:7.4-alpine
+    # Cache only: no persistence, bounded memory. noeviction, not *-lru: evicting a tag
+    # set would lose invalidations. When full, new entries simply aren't cached.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb",
+              "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   api:
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
       <<: *mesh-node
       MESH_REMOTE_SERVICES: notes=http://notes-svc:8000,tasks=http://notes-svc:8000
@@ -31,6 +48,8 @@ services:
     depends_on:
       db-init:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     environment:
       <<: *mesh-node
       DATABASE_URL: sqlite:////data/meetings.db

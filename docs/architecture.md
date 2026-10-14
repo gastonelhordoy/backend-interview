@@ -64,7 +64,7 @@ At registration, the method signature becomes a Pydantic input model and the ret
 
 ## Mesh transports and caching
 
-See [mesh.md](mesh.md). In short: the `ServiceMesh` is the interface services receive; *how* a call travels is a chain of `Transport`s (`CachingTransport`, `RoutingTransport`, `InProcessTransport`, `HttpTransport`) composed in `app/mesh/factory.py` from `MESH_REMOTE_SERVICES`. `InProcessTransport` is the default and holds the local service instances; `HttpTransport` reaches services running on another node through `POST /mesh/{service}/{operation}`. `docker-compose.microservices.yml` runs the app as two nodes.
+See [mesh.md](mesh.md). In short: the `ServiceMesh` is the interface services receive; *how* a call travels is a chain of `Transport`s (`CachingTransport`, `RoutingTransport`, `InProcessTransport`, `HttpTransport`) composed in `app/mesh/factory.py` from `MESH_REMOTE_SERVICES`. The query cache is `InMemoryCache` or, with `CACHE_URL=redis://...`, a `RedisCache` shared by every node. `InProcessTransport` is the default and holds the local service instances; `HttpTransport` reaches services running on another node through `POST /mesh/{service}/{operation}`. `docker-compose.microservices.yml` runs the app as two nodes.
 
 ## MCP server and OAuth
 

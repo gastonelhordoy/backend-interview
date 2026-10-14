@@ -1,4 +1,7 @@
+import time
+
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -34,7 +37,17 @@ def create_tables():
     """
     Create all tables in the database.
     """
-    Base.metadata.create_all(bind=engine)
+    # Several processes starting on the same database (mesh nodes, workers) can race
+    # between "table missing?" and CREATE TABLE. Retrying skips the tables the other
+    # process already created.
+    for attempt in range(5):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
 
 
 def get_db():

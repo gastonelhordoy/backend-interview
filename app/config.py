@@ -40,6 +40,8 @@ class Settings:
     # Public origin used in OAuth metadata and token audiences; defaults to the request's.
     public_base_url: str = field(default_factory=lambda: _env("PUBLIC_BASE_URL", "").rstrip("/"))
     cache_ttl_seconds: float = field(default_factory=lambda: float(_env("CACHE_TTL_SECONDS", "300")))
+    # Empty: in-memory cache per process. redis://host:6379/0: one cache shared by all nodes.
+    cache_url: str = field(default_factory=lambda: _env("CACHE_URL", ""))
 
 
 settings = Settings()

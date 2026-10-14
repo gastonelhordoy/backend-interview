@@ -21,6 +21,8 @@ services:
       # Empty: every service runs in this container. See docker-compose.microservices.yml.
       MESH_REMOTE_SERVICES: ${MESH_REMOTE_SERVICES:-}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      # Empty: in-memory cache. redis://host:6379/0: shared cache (see docker-compose.microservices.yml).
+      CACHE_URL: ${CACHE_URL:-}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
       MCP_ACCESS_TOKEN_TTL_MINUTES: ${MCP_ACCESS_TOKEN_TTL_MINUTES:-30}
       MCP_REFRESH_TOKEN_TTL_DAYS: ${MCP_REFRESH_TOKEN_TTL_DAYS:-30}
