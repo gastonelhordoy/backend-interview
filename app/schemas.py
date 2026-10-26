@@ -5,7 +5,7 @@ from typing import ClassVar, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
-from app.models import TaskStatus
+from app.models import InvitationStatus, TaskStatus
 
 
 class ORMModel(BaseModel):
@@ -37,7 +37,25 @@ class UserCreate(UserBase):
 
 
 class User(UserBase, ORMModel):
+    """Your own account."""
+
     id: int
+    share_name: bool
+
+
+class UserUpdate(PartialUpdate):
+    non_nullable_fields: ClassVar[Tuple[str, ...]] = ("share_name",)
+
+    share_name: Optional[bool] = Field(
+        default=None, description="Show your name to co-attendees and to people who invite you. Your email is always shown.")
+
+
+class UserProfile(BaseModel):
+    """Another user as you see them: the email always, the name only if they chose to share it."""
+
+    id: int
+    email: EmailStr
+    name: Optional[str] = None
 
 
 class Token(BaseModel):
@@ -53,23 +71,52 @@ class MeetingBase(BaseModel):
 
 
 class MeetingCreate(MeetingBase):
-    attendee_ids: List[int] = Field(default=[], description="Users to invite; the creator is always an attendee.")
+    invitee_emails: List[EmailStr] = Field(
+        default=[], description="Emails to invite. Invitees attend once they accept; the creator always attends.")
 
 
 class MeetingUpdate(PartialUpdate):
-    non_nullable_fields: ClassVar[Tuple[str, ...]] = ("title", "scheduled_time", "attendee_ids")
+    non_nullable_fields: ClassVar[Tuple[str, ...]] = ("title", "scheduled_time")
 
     title: Optional[str] = Field(default=None, min_length=1)
     description: Optional[str] = None
     scheduled_time: Optional[datetime] = None
-    attendee_ids: Optional[List[int]] = Field(default=None, description="Replaces the attendee list; the owner is always kept.")
 
 
 class Meeting(MeetingBase, ORMModel):
     id: int
     owner_id: int
     created_at: datetime
-    attendees: List[User] = []
+    attendees: List[UserProfile] = []
+
+
+# Invitation schemas
+class InvitationCreate(BaseModel):
+    emails: List[EmailStr] = Field(min_length=1, description="Emails to invite to the meeting.")
+
+
+class Invitation(ORMModel):
+    """An invitation as the meeting owner sees it."""
+
+    id: int
+    meeting_id: int
+    email: str
+    status: InvitationStatus
+    created_at: datetime
+    responded_at: Optional[datetime] = None
+
+
+class ReceivedInvitation(BaseModel):
+    """An invitation as the invitee sees it: enough to decide, nothing more (no description,
+    attendees, notes or tasks until accepted)."""
+
+    id: int
+    meeting_id: int
+    title: str
+    scheduled_time: datetime
+    invited_by: UserProfile
+    status: InvitationStatus
+    created_at: datetime
 
 
 class MeetingAccess(BaseModel):

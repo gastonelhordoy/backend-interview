@@ -108,7 +108,7 @@ The database starts empty and there are **no default users**: create one with th
 
 **From Swagger UI** (`http://localhost:8000/docs`), do the same without the terminal. Run `POST /users/` with *Try it out*, then click **Authorize** and enter the email as `username` plus the password. Leave `client_id` and `client_secret` empty.
 
-**To try the privacy rules**, register a second user. That user won't see the first user's meetings until they are added as an attendee (`attendee_ids`).
+**To try the privacy rules**, register a second user. That user won't see the first user's meetings until they accept an invitation: the owner invites their email (`invitee_emails` when creating, or `POST /meetings/{id}/invitations`), and they accept it from `GET /invitations/`. Others see only your email unless you set `share_name` with `PUT /users/me`.
 
 ## MCP server (use the API from a chat)
 
@@ -161,16 +161,26 @@ Every endpoint except registration (`POST /users/`) and login (`POST /auth/token
 
 ### Users
 - `POST /users/` - Register a new user (public)
-- `GET /users/me` - Get the authenticated user
-- `GET /users/` - List yourself and users you share a meeting with
-- `GET /users/{user_id}` - Get a specific (visible) user
+- `GET /users/me` - Get the authenticated user, with sharing settings
+- `PUT /users/me` - Change sharing settings (`share_name`: show your name to others; off by default, the email is always shown)
+- `GET /users/` - List yourself, users you share a meeting with and owners of meetings you're invited to
+- `GET /users/{user_id}` - Get a specific (visible) user: email, plus name if they share it
 
 ### Meetings
-- `POST /meetings/` - Create a new meeting with attendees
+- `POST /meetings/` - Create a new meeting, optionally inviting people by email (`invitee_emails`)
 - `GET /meetings/` - List the meetings you attend
 - `GET /meetings/{meeting_id}` - Get a specific meeting with details
 - `PUT /meetings/{meeting_id}` - Update a meeting (owner only)
 - `DELETE /meetings/{meeting_id}` - Delete a meeting with its notes and tasks (owner only)
+- `POST /meetings/{meeting_id}/invitations` - Invite people by email (owner only)
+- `GET /meetings/{meeting_id}/invitations` - List the meeting's invitations and their status (owner only)
+- `DELETE /meetings/{meeting_id}/invitations/{invitation_id}` - Revoke a pending or declined invitation (owner only)
+- `DELETE /meetings/{meeting_id}/attendees/{user_id}` - Remove an attendee (owner), or leave (your own id)
+
+### Invitations
+- `GET /invitations/` - Your pending invitations (meeting title, time, who invited you)
+- `POST /invitations/{invitation_id}/accept` - Accept: you become an attendee
+- `POST /invitations/{invitation_id}/decline` - Decline
 
 ### Notes
 - `POST /notes/` - Create a new note for a meeting
@@ -210,7 +220,7 @@ curl -X POST http://localhost:8000/meetings/ -H "Authorization: Bearer $TOKEN" \
     "title": "Sprint Planning",
     "description": "Q1 Sprint Planning",
     "scheduled_time": "2024-01-15T10:00:00",
-    "attendee_ids": [1, 2]
+    "invitee_emails": ["bob@example.com"]
   }'
 ```
 

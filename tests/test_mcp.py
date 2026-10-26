@@ -36,8 +36,10 @@ def test_tools_list_exposes_decorated_endpoints(client, alice):
     tools = {t["name"]: t for t in rpc(client, alice, "tools/list")["result"]["tools"]}
 
     assert set(tools) == {
-        "create_user", "list_users", "get_me", "get_user",
+        "create_user", "list_users", "get_me", "update_me", "get_user",
         "create_meeting", "list_meetings", "get_meeting", "update_meeting", "delete_meeting",
+        "invite_to_meeting", "list_meeting_invitations", "revoke_invitation", "remove_attendee",
+        "list_my_invitations", "accept_invitation", "decline_invitation",
         "create_note", "list_notes", "get_note",
         "create_task", "list_tasks", "get_task", "update_task", "delete_task",
     }

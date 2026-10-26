@@ -118,6 +118,18 @@ class ApiUser:
         return self._mcp_headers
 
 
+def invite_and_accept(client: TestClient, owner: ApiUser, meeting_id: int, *invitees: ApiUser) -> None:
+    """Invite users by email and accept on their behalf: the only way to become an attendee."""
+    response = client.post(f"/meetings/{meeting_id}/invitations", json={"emails": [u.email for u in invitees]},
+                           headers=owner.headers)
+    assert response.status_code == 201, response.text
+    for invitee in invitees:
+        received = client.get("/invitations/", headers=invitee.headers).json()
+        invitation = next(i for i in received if i["meeting_id"] == meeting_id)
+        accepted = client.post(f"/invitations/{invitation['id']}/accept", headers=invitee.headers)
+        assert accepted.status_code == 200, accepted.text
+
+
 @pytest.fixture
 def alice(client):
     return ApiUser(client, "Alice")

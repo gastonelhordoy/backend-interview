@@ -2,7 +2,8 @@ def test_register_does_not_expose_password(client):
     response = client.post("/users/", json={"name": "Dave", "email": "Dave@Example.com", "password": "long-enough"})
 
     assert response.status_code == 201
-    assert response.json() == {"id": response.json()["id"], "name": "Dave", "email": "dave@example.com"}
+    assert response.json() == {"id": response.json()["id"], "name": "Dave", "email": "dave@example.com",
+                               "share_name": False}
 
 
 def test_register_rejects_duplicate_email_case_insensitively(client, alice):

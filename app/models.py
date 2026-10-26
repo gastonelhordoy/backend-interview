@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, false
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -13,6 +13,12 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class InvitationStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+
+
 class User(Base):
     __tablename__ = 'users'
 
@@ -21,14 +27,16 @@ class User(Base):
     email = Column(String, unique=True, nullable=False, index=True)  # stored lower-cased
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Whether other users (co-attendees, people you were invited by) see your name. Your email is always shared.
+    share_name = Column(Boolean, default=False, server_default=false(), nullable=False)
 
     # Relationships
     meeting_links = relationship('MeetingAttendee', back_populates='user', cascade='all, delete-orphan')
-    meetings = relationship('Meeting', secondary='meeting_users', viewonly=True)
 
 
 class MeetingAttendee(Base):
     """Attendance of a user at a meeting. The source of truth for meeting visibility.
+    Only the owner and users who accepted an invitation are attendees.
 
     A mapped class (rather than a bare association table) so the meetings service can
     manage attendance by id without loading ``User`` rows, and so per-attendee data
@@ -56,10 +64,36 @@ class Meeting(Base):
 
     # Relationships
     owner = relationship('User')
-    attendee_links = relationship('MeetingAttendee', back_populates='meeting', cascade='all, delete-orphan')
-    attendees = relationship('User', secondary='meeting_users', viewonly=True, order_by='User.id')
+    attendee_links = relationship('MeetingAttendee', back_populates='meeting', cascade='all, delete-orphan',
+                                  order_by='MeetingAttendee.user_id')
+    invitations = relationship('MeetingInvitation', back_populates='meeting', cascade='all, delete-orphan')
     notes = relationship('Note', back_populates='meeting', cascade='all, delete-orphan')
     tasks = relationship('Task', back_populates='due_meeting', cascade='all, delete-orphan')
+
+
+class MeetingInvitation(Base):
+    """An invitation to a meeting, addressed to an email. It grants nothing until the
+    invitee accepts it; only then is a ``MeetingAttendee`` row created. The email is not
+    resolved to a user when inviting, so inviting reveals nothing about who is registered.
+    """
+    __tablename__ = 'meeting_invitations'
+    __table_args__ = (UniqueConstraint('meeting_id', 'email'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, ForeignKey('meetings.id', ondelete='CASCADE'), nullable=False, index=True)
+    email = Column(String, nullable=False, index=True)  # stored lower-cased
+    status = Column(
+        Enum(InvitationStatus, native_enum=False, length=20, values_callable=lambda e: [m.value for m in e]),
+        default=InvitationStatus.PENDING,
+        nullable=False,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    responded_at = Column(DateTime)
+    # The user who accepted it; lets the owner remove them (and re-invite later).
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), index=True)
+
+    # Relationships
+    meeting = relationship('Meeting', back_populates='invitations')
 
 
 class Note(Base):

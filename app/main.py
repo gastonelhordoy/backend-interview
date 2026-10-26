@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import auth, meetings, mesh, notes, tasks, tools, users
+from app.api import auth, invitations, meetings, mesh, notes, tasks, tools, users
 from app.db import create_tables
 from app.errors import AuthenticationError, ServiceError
 from app.mcp import server as mcp_server
@@ -23,7 +23,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-for module in (auth, users, meetings, notes, tasks, tools):
+for module in (auth, users, meetings, invitations, notes, tasks, tools):
     app.include_router(module.router)
 app.include_router(mcp_server.router)
 app.include_router(oauth.router)
@@ -48,6 +48,7 @@ async def root():
             "auth": "/auth/token",
             "users": "/users/",
             "meetings": "/meetings/",
+            "invitations": "/invitations/",
             "notes": "/notes/",
             "tasks": "/tasks/",
             "tools": "/tools/",

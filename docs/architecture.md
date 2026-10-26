@@ -31,7 +31,7 @@ Request flow for `GET /meetings/1` as Alice:
 
 * `BaseService` holds the DB session, the `principal` and the `mesh`, plus shared helpers (`_get_visible`, `_apply`, `_save`, `_delete`).
 * Every service implements `_visible()`: a query restricted to rows the principal may read. Every read goes through it. That gives each service a single place where privacy is enforced.
-* Services never import each other. Anything outside their own tables goes through `self.mesh.<service>.<op>(...)`. The meetings service owns attendance (`meeting_users`), so it is the authority the other services ask about access, through internal operations (`access`, `accessible_ids`, `co_attendee_ids`).
+* Services never import each other. Anything outside their own tables goes through `self.mesh.<service>.<op>(...)`. The meetings service owns attendance (`meeting_users`) and invitations (`meeting_invitations`), so it is the authority the other services ask about access, through internal operations (`access`, `accessible_ids`, `co_attendee_ids`, `pending_inviter_ids`). It doesn't read `User` rows either: attendee profiles come from `mesh.users.list()`, so they follow each user's sharing settings.
 * Services return Pydantic schemas, never ORM objects. That makes results safe to cache, safe to send over a wire, and unable to lazy-load data the user shouldn't see.
 * Registration and login (`app/auth/service.py`) are deliberately **not** mesh services: they run before a user exists, and the mesh is per-user.
 
@@ -74,14 +74,31 @@ See [mcp.md](mcp.md). Endpoints marked `@mcp_tool` are published at `POST /mcp` 
 
 | Resource | Read | Create | Update / delete |
 |---|---|---|---|
-| User | yourself and users sharing a meeting with you | public registration | — |
+| User | yourself (full account), users sharing a meeting with you and owners of meetings you have a pending invitation to (email, plus name if they share it) | public registration | yourself (`share_name`) |
 | Meeting | attendees | any user (becomes owner + attendee) | owner only |
+| Invitation | the owner of its meeting; the invitee while it is pending (title, time and who invited them) | meeting owner, by email | invitee accepts or declines; owner revokes (unless accepted) |
+| Attendance | attendees of the meeting | accepting an invitation | owner removes anyone; an attendee removes themselves (leaves) |
 | Note | attendees of its meeting | attendees | — (no endpoints) |
 | Task | attendees of its meeting | attendees | task creator or meeting owner; moving it requires attending the target meeting |
 
 * Anything you can't read returns **404**, never 403, so ids can't be probed. 403 means "you can see it but can't change it".
 * Removing an attendee revokes their access immediately, including any cached reads.
-* Inviting a user by id reveals only whether that id exists (`users.ensure_exist`), never their profile.
+
+### Invitations and profile sharing
+
+Users join meetings only by accepting an invitation. Before this, the owner listed `attendee_ids`: anyone could add sequential ids to a meeting and, being co-attendees, read those users' profiles without their consent.
+
+* The owner invites **emails**, not ids. An invitation grants nothing; accepting it creates the `meeting_users` row. Declining is final; the owner can revoke and invite again.
+* Inviting never resolves the email to a user and always answers the same way, so it can't be used to discover who is registered. The owner sees only the email they typed and its status.
+* Pending invitees are visible only to the owner, not to the other attendees.
+* The invitee sees the meeting's title and time and who invited them; description, attendees, notes and tasks only after accepting.
+* Other users see a `UserProfile`: the email always, the name only if its owner set `share_name` (`PUT /users/me`, off by default). `GET /users/me` returns the full account.
+* Any attendee can leave (`DELETE /meetings/{id}/attendees/{own id}`), which withdraws consent and access at once.
+
+Known limits, not addressed here:
+* Emails are not verified. Someone who registers with an address they don't own would see invitations sent to it and could accept them. Fixing this needs email verification (sending mail), which is out of scope.
+* `POST /users/` answers 409 for a registered email, so registration can still be used to check whether an address has an account. The usual fix also relies on email verification ("check your inbox" for both cases).
+* A declined invitation can only come from a registered account, so the owner learns that the invitee's email is registered. They still learn nothing else about that account.
 
 ## Authentication
 
@@ -103,9 +120,12 @@ See [mcp.md](mcp.md). Endpoints marked `@mcp_tool` are published at `POST /mcp` 
 | Tasks cascade-delete with their meeting; `ON DELETE CASCADE` FKs; `PRAGMA foreign_keys=ON` | `Task.due_meeting_id` is non-nullable, so deleting a meeting with tasks used to fail. SQLite ignores FKs unless the pragma is enabled |
 | Indexes on `meeting_id`, `due_meeting_id`, owner/author columns, `meeting_users.user_id` | Every visibility query filters on these columns |
 | `PartialUpdate` schemas reject explicit `null` for required fields | `{"title": null}` used to reach the DB as a NOT NULL violation |
+| `meeting_invitations` (`MeetingInvitation`: email, `InvitationStatus`, `user_id` once accepted); `MeetingCreate.attendee_ids` and `MeetingUpdate.attendee_ids` removed | Join by consent instead of being added by id (see [Invitations and profile sharing](#invitations-and-profile-sharing)) |
+| `User.share_name` (default `false`); the ORM `Meeting.attendees` / `User.meetings` relationships removed | What others see of you is your choice; meetings can no longer serialize `User` rows behind the users service's back |
 
 Possible next steps, not implemented:
-* Alembic migrations. Tables are currently created at startup, so after a schema change an existing `meetings.db` has to be deleted.
+* Alembic migrations. Tables are currently created at startup, so after a schema change an existing `meetings.db` has to be deleted (or altered by hand, e.g. `ALTER TABLE users ADD COLUMN share_name BOOLEAN DEFAULT 0 NOT NULL`).
+* Email verification (see the known limits above).
 * `Task.assignee_id`.
 * Timezone-aware datetimes.
 * Note editing.

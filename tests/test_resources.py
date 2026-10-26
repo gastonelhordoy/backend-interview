@@ -1,4 +1,5 @@
 """Write every resource through the API (and so through the mesh and services), then read it back."""
+from tests.conftest import invite_and_accept
 
 
 def create_meeting(client, user, **overrides):
@@ -9,7 +10,8 @@ def create_meeting(client, user, **overrides):
 
 
 def test_meeting_round_trip(client, alice, bob):
-    created = create_meeting(client, alice, description="Q1", attendee_ids=[bob.id])
+    created = create_meeting(client, alice, description="Q1")
+    invite_and_accept(client, alice, created["id"], bob)
 
     fetched = client.get(f"/meetings/{created['id']}", headers=alice.headers).json()
 
@@ -21,24 +23,16 @@ def test_meeting_round_trip(client, alice, bob):
     assert [m["id"] for m in client.get("/meetings/", headers=alice.headers).json()] == [created["id"]]
 
 
-def test_meeting_rejects_unknown_attendee(client, alice):
-    response = client.post("/meetings/", json={"title": "x", "scheduled_time": "2024-01-15T10:00:00",
-                                               "attendee_ids": [999]}, headers=alice.headers)
-
-    assert response.status_code == 404
-
-
-def test_meeting_update(client, alice, bob):
+def test_meeting_update(client, alice):
     meeting = create_meeting(client, alice)
 
-    response = client.put(f"/meetings/{meeting['id']}", json={"title": "Renamed", "attendee_ids": [bob.id]},
-                          headers=alice.headers)
+    response = client.put(f"/meetings/{meeting['id']}", json={"title": "Renamed"}, headers=alice.headers)
 
     assert response.status_code == 200
     fetched = client.get(f"/meetings/{meeting['id']}", headers=alice.headers).json()
     assert fetched["title"] == "Renamed"
     assert fetched["scheduled_time"] == "2024-01-15T10:00:00"
-    assert [a["id"] for a in fetched["attendees"]] == [alice.id, bob.id]
+    assert [a["id"] for a in fetched["attendees"]] == [alice.id]
 
 
 def test_meeting_update_rejects_null_for_required_field(client, alice):

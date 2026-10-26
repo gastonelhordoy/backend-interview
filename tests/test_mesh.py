@@ -29,6 +29,13 @@ def register(db, name):
     return Principal(user.id)
 
 
+def join(owner_mesh, invitee_mesh, meeting_id, email):
+    """Invite by email through the owner's mesh, accept through the invitee's."""
+    owner_mesh.meetings.invite(meeting_id=meeting_id, data=schemas.InvitationCreate(emails=[email]))
+    invitation = next(i for i in invitee_mesh.meetings.received_invitations() if i.meeting_id == meeting_id)
+    invitee_mesh.meetings.accept_invitation(invitation_id=invitation.id)
+
+
 @pytest.fixture
 def alice(db):
     return register(db, "alice")
@@ -47,8 +54,10 @@ def test_get_tools_lists_public_operations_only(db, alice):
     tools = {tool["name"]: tool for tool in build_mesh(alice, db).get_tools()}
 
     assert set(tools) == {
-        "users_me", "users_list", "users_get",
+        "users_me", "users_update_me", "users_list", "users_get",
         "meetings_list", "meetings_get", "meetings_create", "meetings_update", "meetings_delete",
+        "meetings_invite", "meetings_list_invitations", "meetings_revoke_invitation", "meetings_remove_attendee",
+        "meetings_received_invitations", "meetings_accept_invitation", "meetings_decline_invitation",
         "notes_list", "notes_get", "notes_create",
         "tasks_list", "tasks_get", "tasks_create", "tasks_update", "tasks_delete",
     }
@@ -84,9 +93,13 @@ def test_queries_are_cached_per_user_and_invalidated_by_commands(db, alice, bob)
     meshes[bob].meetings.list()
     assert recorder.calls.count("meetings.list") == 2  # other user, other cache entry
 
-    meshes[alice].meetings.create(data=new_meeting(attendee_ids=[bob.user_id]))
+    meeting = meshes[alice].meetings.create(data=new_meeting())
+    join(meshes[alice], meshes[bob], meeting.id, "bob@example.com")
     assert [m.title for m in meshes[bob].meetings.list()] == ["Standup"]  # bob's entry was invalidated
     assert recorder.calls.count("meetings.list") == 3
+
+    meshes[alice].meetings.update(meeting_id=meeting.id, data=schemas.MeetingUpdate(title="Retro"))
+    assert [m.title for m in meshes[bob].meetings.list()] == ["Retro"]  # alice's write reaches bob's cache
 
 
 def test_services_call_each_other_through_the_mesh(db, alice):
@@ -105,7 +118,7 @@ def test_routing_transport_sends_services_to_their_transport(db, alice):
     users_route = RecordingTransport(InProcessTransport(db))
     mesh = ServiceMesh(alice, RoutingTransport(default=InProcessTransport(db), routes={"users": users_route}))
 
-    mesh.meetings.list()
+    mesh.notes.list()
     mesh.users.me()
 
     assert users_route.calls == ["users.me"]
@@ -121,7 +134,7 @@ def test_in_process_transport_keeps_one_instance_per_service(db, alice):
     first = dict(transport._services)
     mesh.meetings.list()
 
-    assert set(first) == {("meetings", alice.user_id), ("notes", alice.user_id)}
+    assert set(first) == {("meetings", alice.user_id), ("notes", alice.user_id), ("users", alice.user_id)}
     assert transport._services == first  # same instances, not new ones per call
     assert first[("notes", alice.user_id)].mesh is mesh
 
@@ -134,12 +147,14 @@ def remote_node():
 def test_http_transport_preserves_results_and_errors(db, alice, bob):
     alice_mesh = ServiceMesh(alice, RoutingTransport(InProcessTransport(db), routes={"meetings": remote_node()}))
     bob_mesh = ServiceMesh(bob, remote_node())
-    meeting = alice_mesh.meetings.create(data=new_meeting(attendee_ids=[bob.user_id]))
+    meeting = alice_mesh.meetings.create(data=new_meeting())
+    join(alice_mesh, bob_mesh, meeting.id, "bob@example.com")
 
     details = bob_mesh.meetings.get(meeting_id=meeting.id)
 
     assert isinstance(details, schemas.MeetingWithDetails)
-    assert [user.id for user in details.attendees] == [alice.user_id, bob.user_id]
+    assert details.attendees == [schemas.UserProfile(id=alice.user_id, email="alice@example.com"),
+                                 schemas.UserProfile(id=bob.user_id, email="bob@example.com", name="bob")]
     with pytest.raises(PermissionDeniedError):
         bob_mesh.meetings.delete(meeting_id=meeting.id)
     with pytest.raises(NotFoundError):

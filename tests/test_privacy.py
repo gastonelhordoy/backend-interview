@@ -1,11 +1,14 @@
 import pytest
 
+from tests.conftest import invite_and_accept
+
 
 @pytest.fixture
 def shared(client, alice, bob):
     """A meeting owned by Alice and attended by Bob, with one note and one task by Alice."""
-    meeting = client.post("/meetings/", json={"title": "1:1", "scheduled_time": "2024-01-15T10:00:00",
-                                              "attendee_ids": [bob.id]}, headers=alice.headers).json()
+    meeting = client.post("/meetings/", json={"title": "1:1", "scheduled_time": "2024-01-15T10:00:00"},
+                          headers=alice.headers).json()
+    invite_and_accept(client, alice, meeting["id"], bob)
     note = client.post("/notes/", json={"content": "secret", "meeting_id": meeting["id"]}, headers=alice.headers).json()
     task = client.post("/tasks/", json={"title": "t", "due_meeting_id": meeting["id"]}, headers=alice.headers).json()
     return {"meeting": meeting["id"], "note": note["id"], "task": task["id"]}
@@ -73,7 +76,7 @@ def test_removed_attendee_loses_access_immediately(client, shared, alice, bob):
     assert client.get(f"/meetings/{shared['meeting']}", headers=bob.headers).status_code == 200
     assert client.get(f"/notes/{shared['note']}", headers=bob.headers).status_code == 200
 
-    client.put(f"/meetings/{shared['meeting']}", json={"attendee_ids": []}, headers=alice.headers)
+    assert client.delete(f"/meetings/{shared['meeting']}/attendees/{bob.id}", headers=alice.headers).status_code == 204
 
     assert client.get(f"/meetings/{shared['meeting']}", headers=bob.headers).status_code == 404
     assert client.get(f"/notes/{shared['note']}", headers=bob.headers).status_code == 404
